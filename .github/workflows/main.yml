@@ -1,0 +1,8 @@
+.github/workflows/build.yml
+app/src/main/AndroidManifest.xml
+app/src/main/java/com/nova/assistant/MainActivity.kt
+app/build.gradle.kts
+build.gradle.kts
+settings.gradle.kts
+gradle.properties
+.gitignore
