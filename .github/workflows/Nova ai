@@ -1,0 +1,419 @@
+#!/bin/bash
+# Creates the complete Nova Android project in ./nova
+mkdir -p nova/.github/workflows nova/app/src/main/java/com/nova/assistant
+cd nova
+
+cat > .github/workflows/build.yml <<'EOF'
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nova-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+EOF
+
+cat > build.gradle.kts <<'EOF'
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+}
+EOF
+
+cat > settings.gradle.kts <<'EOF'
+pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+rootProject.name = "Nova"
+include(":app")
+EOF
+
+cat > gradle.properties <<'EOF'
+android.useAndroidX=true
+org.gradle.jvmargs=-Xmx2g
+kotlin.code.style=official
+EOF
+
+cat > .gitignore <<'EOF'
+*.iml
+.gradle
+build/
+local.properties
+.idea
+EOF
+
+cat > README.md <<'EOF'
+# Nova Assistant (Android)
+Voice assistant + chatbot + draw-to-open launcher.
+Build: push this folder's contents to a GitHub repo, open Actions -> "Build APK",
+then download the Nova-debug-apk artifact and install the APK.
+EOF
+
+cat > app/build.gradle.kts <<'EOF'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+}
+android {
+    namespace = "com.nova.assistant"
+    compileSdk = 34
+    defaultConfig {
+        applicationId = "com.nova.assistant"
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+    buildFeatures { compose = true }
+    composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+}
+dependencies {
+    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+}
+EOF
+
+cat > app/src/main/AndroidManifest.xml <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+    <application
+        android:allowBackup="true"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="Nova Assistant"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+EOF
+
+cat > app/src/main/java/com/nova/assistant/MainActivity.kt <<'EOF'
+package com.nova.assistant
+
+import android.content.*
+import android.os.Bundle
+import android.speech.RecognizerIntent
+import android.speech.tts.TextToSpeech
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.shape.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.*
+import androidx.compose.ui.draw.*
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.*
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.*
+import androidx.core.graphics.drawable.toBitmap
+import kotlinx.coroutines.*
+import org.json.*
+import java.net.*
+import java.text.SimpleDateFormat
+import java.util.*
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(b: Bundle?) { super.onCreate(b); setContent { Nova() } }
+}
+
+data class AppInfo(val name: String, val pkg: String, val icon: ImageBitmap)
+data class Gest(val pkg: String, val pts: List<Offset>)
+
+/* ---------- installed apps: launched directly by package name ---------- */
+fun loadApps(c: Context): List<AppInfo> {
+    val pm = c.packageManager
+    val i = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    return pm.queryIntentActivities(i, 0)
+        .map { AppInfo(it.loadLabel(pm).toString(), it.activityInfo.packageName, it.loadIcon(pm).toBitmap(96, 96).asImageBitmap()) }
+        .distinctBy { it.pkg }.sortedBy { it.name.lowercase() }
+}
+fun launch(c: Context, pkg: String): Boolean {
+    val i = c.packageManager.getLaunchIntentForPackage(pkg) ?: return false
+    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); c.startActivity(i); return true
+}
+fun findApp(a: List<AppInfo>, q: String): AppInfo? {
+    val s = q.trim().lowercase(); if (s.isEmpty()) return null
+    return a.firstOrNull { it.name.lowercase() == s }
+        ?: a.firstOrNull { it.name.lowercase().contains(s) || s.contains(it.name.lowercase()) }
+}
+
+/* ---------- gesture recognizer ---------- */
+fun resample(p: List<Offset>, n: Int = 48): List<Offset> {
+    var len = 0f
+    for (i in 1 until p.size) len += (p[i] - p[i - 1]).getDistance()
+    val step = len / (n - 1)
+    val q = p.toMutableList(); val out = mutableListOf(p[0]); var d = 0f; var i = 1
+    while (i < q.size) {
+        val seg = (q[i] - q[i - 1]).getDistance()
+        if (seg > 0f && d + seg >= step) {
+            val np = q[i - 1] + (q[i] - q[i - 1]) * ((step - d) / seg)
+            out.add(np); q.add(i, np); d = 0f
+        } else d += seg
+        i++
+    }
+    while (out.size < n) out.add(q.last())
+    return out.take(n)
+}
+fun norm(p: List<Offset>): List<Offset> {
+    val r = resample(p)
+    val x0 = r.minOf { it.x }; val x1 = r.maxOf { it.x }; val y0 = r.minOf { it.y }; val y1 = r.maxOf { it.y }
+    val s = maxOf(x1 - x0, y1 - y0, 1f); val c = Offset((x0 + x1) / 2, (y0 + y1) / 2)
+    return r.map { (it - c) / s }
+}
+fun dist(a: List<Offset>, b: List<Offset>) = a.indices.sumOf { (a[it] - b[it]).getDistance().toDouble() }.toFloat() / a.size
+fun saveG(c: Context, l: List<Gest>) {
+    val arr = JSONArray()
+    l.forEach { g -> arr.put(JSONObject().put("p", g.pkg)
+        .put("x", JSONArray(g.pts.map { it.x.toDouble() })).put("y", JSONArray(g.pts.map { it.y.toDouble() }))) }
+    c.getSharedPreferences("nova", 0).edit().putString("g", arr.toString()).apply()
+}
+fun loadG(c: Context): List<Gest> = try {
+    val arr = JSONArray(c.getSharedPreferences("nova", 0).getString("g", "[]"))
+    (0 until arr.length()).map { val o = arr.getJSONObject(it); val x = o.getJSONArray("x"); val y = o.getJSONArray("y")
+        Gest(o.getString("p"), (0 until x.length()).map { k -> Offset(x.getDouble(k).toFloat(), y.getDouble(k).toFloat()) }) }
+} catch (e: Exception) { emptyList() }
+
+/* ---------- brain: tools + Wikipedia + optional Claude ---------- */
+fun http(url: String, method: String = "GET", h: Map<String, String> = emptyMap(), body: String? = null): String {
+    val c = URL(url).openConnection() as HttpURLConnection
+    c.requestMethod = method; c.connectTimeout = 10000; c.readTimeout = 25000
+    h.forEach { (k, v) -> c.setRequestProperty(k, v) }
+    if (body != null) { c.doOutput = true; c.outputStream.use { it.write(body.toByteArray()) } }
+    val s = if (c.responseCode < 400) c.inputStream else c.errorStream
+    return s.bufferedReader().readText()
+}
+fun smart(text: String, key: String): String {
+    val t = text.lowercase()
+    if (Regex("\\btime\\b").containsMatchIn(t) && t.length < 30) return SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
+    if (Regex("\\b(date|today)\\b").containsMatchIn(t) && t.length < 30) return SimpleDateFormat("EEEE, d MMMM yyyy", Locale.getDefault()).format(Date())
+    Regex("(-?\\d+(?:\\.\\d+)?)\\s*(\\+|-|\\*|x|times|/|divided by|plus|minus)\\s*(-?\\d+(?:\\.\\d+)?)").find(t)?.let {
+        val a = it.groupValues[1].toDouble(); val b = it.groupValues[3].toDouble()
+        val r = when (it.groupValues[2]) { "+", "plus" -> a + b; "-", "minus" -> a - b; "*", "x", "times" -> a * b; else -> a / b }
+        return "${it.value} = ${"%.6f".format(r).trimEnd('0').trimEnd('.')}"
+    }
+    if (key.isNotBlank()) {
+        val body = JSONObject().put("model", "claude-sonnet-4-6").put("max_tokens", 500)
+            .put("system", "You are Nova, a friendly voice assistant. Answer briefly in plain text, no markdown.")
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", text))).toString()
+        val r = JSONObject(http("https://api.anthropic.com/v1/messages", "POST",
+            mapOf("content-type" to "application/json", "x-api-key" to key, "anthropic-version" to "2023-06-01"), body))
+        return if (r.has("error")) "API error: " + r.getJSONObject("error").getString("message") else r.getJSONArray("content").getJSONObject(0).getString("text")
+    }
+    val q = text.replace(Regex("^(who is|who was|what is|what are|tell me about|define|explain)\\s+", RegexOption.IGNORE_CASE), "").trim('?', ' ')
+    val s = JSONObject(http("https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=1&srsearch=" + URLEncoder.encode(q, "UTF-8")))
+    val hit = s.getJSONObject("query").getJSONArray("search").optJSONObject(0)?.getString("title")
+        ?: return "I couldn't find that. Add an API key in settings for full AI answers."
+    val d = JSONObject(http("https://en.wikipedia.org/api/rest_v1/page/summary/" + URLEncoder.encode(hit, "UTF-8").replace("+", "%20")))
+    return d.optString("extract", "No summary found.").split(". ").take(3).joinToString(". ")
+}
+
+/* ---------- UI ---------- */
+val Violet = Color(0xFF7C5CFF); val Cyan = Color(0xFF22D3EE)
+
+@Composable
+fun Nova() {
+    val ctx = LocalContext.current
+    val apps = remember { loadApps(ctx) }
+    var tab by remember { mutableStateOf(0) }
+    var settings by remember { mutableStateOf(false) }
+    MaterialTheme(colorScheme = darkColorScheme(primary = Violet, secondary = Cyan)) {
+        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF241A5E), Color(0xFF0B0D1A))))) {
+            Column(Modifier.fillMaxSize().systemBarsPadding()) {
+                Row(Modifier.fillMaxWidth().padding(20.dp, 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("✨ Nova", fontSize = 24.sp, color = Color.White, modifier = Modifier.weight(1f))
+                    Text("⚙️", fontSize = 22.sp, modifier = Modifier.clickable { settings = true })
+                }
+                Box(Modifier.weight(1f)) { if (tab == 0) Chat(apps) else DrawTab(apps) }
+                NavigationBar(containerColor = Color(0x33FFFFFF)) {
+                    NavigationBarItem(tab == 0, { tab = 0 }, { Text("💬") }, label = { Text("Assistant") })
+                    NavigationBarItem(tab == 1, { tab = 1 }, { Text("✍️") }, label = { Text("Draw") })
+                }
+            }
+        }
+        if (settings) {
+            val p = ctx.getSharedPreferences("nova", 0)
+            var k by remember { mutableStateOf(p.getString("key", "") ?: "") }
+            AlertDialog(onDismissRequest = { settings = false },
+                confirmButton = { TextButton({ p.edit().putString("key", k.trim()).apply(); settings = false }) { Text("Save") } },
+                title = { Text("Full AI (optional)") },
+                text = { OutlinedTextField(k, { k = it }, singleLine = true, label = { Text("Anthropic API key") }) })
+        }
+    }
+}
+
+@Composable
+fun Chat(apps: List<AppInfo>) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val msgs = remember { mutableStateListOf(false to "Hi, I'm Nova ✨ Ask me anything, say \"open WhatsApp\", or draw a shape to launch an app.") }
+    var input by remember { mutableStateOf("") }
+    val tts = remember { TextToSpeech(ctx) { } }
+    DisposableEffect(Unit) { onDispose { tts.shutdown() } }
+    val ls = rememberLazyListState()
+    LaunchedEffect(msgs.size) { ls.animateScrollToItem(msgs.size - 1) }
+    fun send(text: String) {
+        if (text.isBlank()) return
+        msgs.add(true to text); input = ""
+        scope.launch {
+            val m = Regex("^(?:please )?(?:open|launch|start)\\s+(.+)$").find(text.lowercase().trim())
+            val key = ctx.getSharedPreferences("nova", 0).getString("key", "") ?: ""
+            val reply = if (m != null) {
+                val a = findApp(apps, m.groupValues[1])
+                if (a != null && launch(ctx, a.pkg)) "Opening ${a.name} ✅" else "I couldn't find \"${m.groupValues[1]}\" on this phone."
+            } else withContext(Dispatchers.IO) { runCatching { smart(text, key) }.getOrElse { "Error: ${it.message}" } }
+            msgs.add(false to reply)
+            tts.speak(reply.take(300), TextToSpeech.QUEUE_FLUSH, null, "nova")
+        }
+    }
+    val voice = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+        r.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.let { send(it) }
+    }
+    val pulse by rememberInfiniteTransition(label = "p").animateFloat(1f, 1.1f, infiniteRepeatable(tween(900), RepeatMode.Reverse), label = "s")
+    Column(Modifier.fillMaxSize().padding(horizontal = 14.dp)) {
+        LazyColumn(Modifier.weight(1f), state = ls, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(msgs) { (me, t) ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = if (me) Arrangement.End else Arrangement.Start) {
+                    Text(t, color = Color.White, modifier = Modifier.widthIn(max = 300.dp)
+                        .background(if (me) Brush.linearGradient(listOf(Violet, Color(0xFF5B8CFF))) else Brush.linearGradient(listOf(Color(0x22FFFFFF), Color(0x22FFFFFF))), RoundedCornerShape(18.dp))
+                        .padding(12.dp, 9.dp))
+                }
+            }
+        }
+        LazyRow(Modifier.padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(listOf("What time is it", "Open Camera", "Tell me about Mars", "12 times 8")) { c ->
+                Text(c, color = Color.White, fontSize = 13.sp, modifier = Modifier.clip(CircleShape).background(Color(0x22FFFFFF)).clickable { send(c) }.padding(12.dp, 7.dp))
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(input, { input = it }, Modifier.weight(1f), singleLine = true, shape = RoundedCornerShape(28.dp), placeholder = { Text("Ask anything…") })
+            Spacer(Modifier.width(6.dp))
+            Text("➤", fontSize = 22.sp, color = Color.White, modifier = Modifier.clickable { send(input) }.padding(8.dp))
+            Box(Modifier.size(58.dp).scale(pulse).background(Brush.radialGradient(listOf(Cyan, Violet)), CircleShape).clickable {
+                try { voice.launch(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)) }
+                catch (e: Exception) { msgs.add(false to "Voice input isn't available on this device.") }
+            }, contentAlignment = Alignment.Center) { Text("🎤", fontSize = 24.sp) }
+        }
+    }
+}
+
+@Composable
+fun DrawTab(apps: List<AppInfo>) {
+    val ctx = LocalContext.current
+    var pts by remember { mutableStateOf(listOf<Offset>()) }
+    var gests by remember { mutableStateOf(loadG(ctx)) }
+    var status by remember { mutableStateOf("Draw a shape to open its app") }
+    var pick by remember { mutableStateOf(false) }
+    fun recognize() {
+        if (pts.size < 8) { status = "Too short — draw a bigger shape"; return }
+        val n = norm(pts)
+        val best = gests.minByOrNull { dist(n, it.pts) }
+        if (best != null && dist(n, best.pts) < 0.16f) {
+            val a = apps.firstOrNull { it.pkg == best.pkg }
+            status = "✓ Opening ${a?.name ?: best.pkg}"; launch(ctx, best.pkg)
+        } else status = "No match — save this drawing for an app ↓"
+    }
+    Column(Modifier.fillMaxSize().padding(14.dp)) {
+        Canvas(Modifier.fillMaxWidth().height(320.dp).clip(RoundedCornerShape(24.dp)).background(Color(0x14FFFFFF))
+            .border(1.5.dp, Color(0x33FFFFFF), RoundedCornerShape(24.dp))
+            .pointerInput(Unit) {
+                detectDragGestures(onDragStart = { pts = listOf(it) }, onDrag = { c, _ -> pts = pts + c.position }, onDragEnd = { recognize() })
+            }) {
+            if (pts.size > 1) {
+                val path = Path().apply { pts.forEachIndexed { i, o -> if (i == 0) moveTo(o.x, o.y) else lineTo(o.x, o.y) } }
+                drawPath(path, Brush.linearGradient(listOf(Violet, Cyan)), style = Stroke(14f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
+        }
+        Text(status, color = Color(0xFFB8BEE8), modifier = Modifier.padding(vertical = 10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button({ if (pts.size >= 8) pick = true else status = "Draw a shape first" }) { Text("Save as gesture") }
+            OutlinedButton({ pts = emptyList(); status = "Draw a shape to open its app" }) { Text("Clear") }
+        }
+        Text("My gestures", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(top = 16.dp, bottom = 4.dp))
+        LazyColumn {
+            items(gests) { g ->
+                val a = apps.firstOrNull { it.pkg == g.pkg }
+                Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (a != null) Image(a.icon, null, Modifier.size(34.dp))
+                    Text(a?.name ?: g.pkg, color = Color.White, modifier = Modifier.weight(1f).padding(start = 12.dp))
+                    TextButton({ gests = gests - g; saveG(ctx, gests) }) { Text("Delete") }
+                }
+            }
+        }
+    }
+    if (pick) AppPicker(apps, { pick = false }) { a ->
+        gests = gests + Gest(a.pkg, norm(pts)); saveG(ctx, gests); pick = false; status = "Saved for ${a.name}. Draw it again to launch."
+    }
+}
+
+@Composable
+fun AppPicker(apps: List<AppInfo>, onDismiss: () -> Unit, onPick: (AppInfo) -> Unit) {
+    var q by remember { mutableStateOf("") }
+    AlertDialog(onDismissRequest = onDismiss, confirmButton = { TextButton(onDismiss) { Text("Cancel") } },
+        title = { Text("Open which app?") },
+        text = {
+            Column {
+                OutlinedTextField(q, { q = it }, singleLine = true, placeholder = { Text("Search apps") })
+                LazyColumn(Modifier.height(320.dp)) {
+                    items(apps.filter { it.name.contains(q, true) }) { a ->
+                        Row(Modifier.fillMaxWidth().clickable { onPick(a) }.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Image(a.icon, null, Modifier.size(36.dp)); Spacer(Modifier.width(12.dp)); Text(a.name)
+                        }
+                    }
+                }
+            }
+        })
+}
+EOF
+
+echo "Done. Project created in: $(pwd)"
